@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import re
 import secrets
 import string
+import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -658,6 +660,79 @@ class AnthropicProvider(LLMProvider):
         )
 
     # ------------------------------------------------------------------
+    # Diagnostics: capture relay-mangled tool_use (missing name)
+    # ------------------------------------------------------------------
+
+    def _capture_malformed_toolcall(
+        self,
+        kwargs: dict[str, Any],
+        response: Any,
+        *,
+        stream: bool,
+        sse_tool_starts: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Dump the full request+response when a tool_use block has a missing/
+        non-string name.
+
+        Diagnostic for the upstream (Bedrock-backed) relay intermittently
+        dropping tool_use names. Writes one JSON file per occurrence to
+        ``~/.nanobot/logs/malformed_toolcall_*.json`` so we can see exactly what
+        survives (id? input? name in the SSE start event?). On by default;
+        opt out with ``NANOBOT_NO_MALFORMED_CAPTURE=1``. Never raises.
+        """
+        if os.environ.get("NANOBOT_NO_MALFORMED_CAPTURE") == "1":
+            return
+        try:
+            blocks = list(getattr(response, "content", None) or [])
+            malformed = [
+                b for b in blocks
+                if getattr(b, "type", None) == "tool_use"
+                and not (
+                    isinstance(getattr(b, "name", None), str)
+                    and getattr(b, "name", None)
+                )
+            ]
+            if not malformed:
+                return
+
+            def _dump_block(b: Any) -> Any:
+                for attr in ("model_dump", "dict", "to_dict"):
+                    fn = getattr(b, attr, None)
+                    if callable(fn):
+                        try:
+                            return fn()
+                        except Exception:
+                            pass
+                return {"type": getattr(b, "type", None), "repr": str(b)[:1000]}
+
+            from nanobot.config.paths import get_logs_dir
+
+            ts = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1_000_000:06d}"
+            path = get_logs_dir() / f"malformed_toolcall_{ts}.json"
+            payload = {
+                "captured_at": ts,
+                "stream": stream,
+                "model": kwargs.get("model"),
+                "stop_reason": getattr(response, "stop_reason", None),
+                "malformed_count": len(malformed),
+                "sse_tool_starts": sse_tool_starts,
+                "response_content": [_dump_block(b) for b in blocks],
+                "request_system": kwargs.get("system"),
+                "request_tool_names": [
+                    (t.get("name") if isinstance(t, dict) else None)
+                    for t in (kwargs.get("tools") or [])
+                ],
+                "request_messages": kwargs.get("messages"),
+            }
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+            logger.warning(
+                "Captured malformed tool_use ({} block(s), stream={}) -> {}",
+                len(malformed), stream, path,
+            )
+        except Exception:
+            logger.exception("Failed to capture malformed tool_use payload")
+
+    # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
@@ -684,6 +759,7 @@ class AnthropicProvider(LLMProvider):
         )
         try:
             response = await self._client.messages.create(**kwargs)
+            self._capture_malformed_toolcall(kwargs, response, stream=False)
             return self._parse_response(response)
         except Exception as e:
             if self._is_streaming_required_error(e):
@@ -721,6 +797,7 @@ class AnthropicProvider(LLMProvider):
             reasoning_effort, tool_choice,
         )
         idle_timeout_s = resolve_stream_idle_timeout_s()
+        sse_tool_starts: list[dict[str, Any]] = []
         try:
             async with self._client.messages.stream(**kwargs) as stream:
                 if on_content_delta or on_thinking_delta or on_tool_call_delta:
@@ -746,6 +823,16 @@ class AnthropicProvider(LLMProvider):
                                     "name": str(getattr(block, "name", "") or ""),
                                 }
                                 tool_blocks[index] = state
+                                # Diagnostic: record the raw start event so we can
+                                # tell whether the relay dropped the name in the SSE
+                                # stream itself or only in the assembled message.
+                                _raw_name = getattr(block, "name", None)
+                                sse_tool_starts.append({
+                                    "index": index,
+                                    "id": getattr(block, "id", None),
+                                    "name": _raw_name,
+                                    "name_present": isinstance(_raw_name, str) and bool(_raw_name),
+                                })
                                 if on_tool_call_delta:
                                     await on_tool_call_delta({
                                         "index": index,
@@ -784,6 +871,9 @@ class AnthropicProvider(LLMProvider):
                     stream.get_final_message(),
                     timeout=idle_timeout_s,
                 )
+            self._capture_malformed_toolcall(
+                kwargs, response, stream=True, sse_tool_starts=sse_tool_starts,
+            )
             return self._parse_response(response)
         except asyncio.TimeoutError:
             return LLMResponse(
