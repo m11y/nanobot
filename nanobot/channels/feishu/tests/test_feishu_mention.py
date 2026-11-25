@@ -3,13 +3,14 @@ from types import SimpleNamespace
 from nanobot.channels.feishu.runtime import FeishuChannel
 
 
-def _make_channel(bot_open_id: str | None = None) -> FeishuChannel:
+def _make_channel(bot_open_id: str | None = None, ignore_mention_all: bool = False) -> FeishuChannel:
     config = SimpleNamespace(
         app_id="test_id",
         app_secret="test_secret",
         verification_token="",
         event_encrypt_key="",
         group_policy="mention",
+        ignore_mention_all=ignore_mention_all,
     )
     ch = FeishuChannel.__new__(FeishuChannel)
     ch.config = config
@@ -40,6 +41,18 @@ class TestIsBotMentioned:
     def test_at_all_always_matches(self):
         ch = _make_channel(bot_open_id="ou_bot123")
         msg = _make_message(content="@_all hello")
+        assert ch._is_bot_mentioned(msg) is True
+
+    def test_at_all_ignored_when_configured(self):
+        ch = _make_channel(bot_open_id="ou_bot123", ignore_mention_all=True)
+        msg = _make_message(content="@_all hello")
+        assert ch._is_bot_mentioned(msg) is False
+
+    def test_at_all_with_direct_mention_still_matches_when_ignored(self):
+        ch = _make_channel(bot_open_id="ou_bot123", ignore_mention_all=True)
+        msg = _make_message(
+            content="@_all hello", mentions=[_make_mention("ou_bot123")],
+        )
         assert ch._is_bot_mentioned(msg) is True
 
     def test_fallback_heuristic_when_no_bot_open_id(self):

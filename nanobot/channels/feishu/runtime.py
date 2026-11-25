@@ -1288,7 +1288,10 @@ class FeishuChannel(BaseChannel):
 
     def _is_bot_mentioned(self, message: Any) -> bool:
         raw_content = message.content or ""
-        if "@_all" in raw_content:
+        # @_all is Feishu's "@everyone" placeholder. A group can ask for it to be
+        # ignored so broadcast-only messages never wake the bot; a message that
+        # also mentions the bot directly still matches via the loop below.
+        if "@_all" in raw_content and not getattr(self.config, "ignore_mention_all", False):
             return True
 
         for mention in cast(list[Any], getattr(message, "mentions", None) or []):

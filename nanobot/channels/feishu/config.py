@@ -21,6 +21,10 @@ class FeishuConfig(Base):
     done_emoji: str | None = None
     tool_hint_prefix: str = "\U0001f527"
     group_policy: Literal["open", "mention"] = "mention"
+    # Feishu @所有人 (@_all) reaches every bot in a group. By default it counts as
+    # a mention of this bot (long-standing behaviour); set this to true to treat a
+    # broadcast-only @_all as NOT a mention, matching OpenClaw's semantics.
+    ignore_mention_all: bool = False
     reply_to_message: bool = False
     streaming: bool = True
     domain: Literal["feishu", "lark"] = "feishu"
